@@ -266,9 +266,9 @@ def _compose_recommendation_message(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.tools: list[dict[str, Any]] = []
-    app.state.mcp_url: Optional[str] = None
-    app.state.llm: Optional[ChatOpenAI] = None
+    app.state.tools = []
+    app.state.mcp_url = None
+    app.state.llm = None
 
     async def _initialize() -> None:
         try:
