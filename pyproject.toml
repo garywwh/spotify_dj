@@ -1,0 +1,19 @@
+[project]
+name = "spotify-dj"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "asyncio>=4.0.0",
+    "fastapi>=0.117.1",
+    "importlib>=1.0.4",
+    "langchain>=0.3.27",
+    "langchain-core>=0.3.76",
+    "langchain-openai>=0.3.33",
+    "langserve>=0.3.2",
+    "mcp>=1.16.0",
+    "python-dotenv>=1.1.1",
+    "sse-starlette>=3.0.2",
+    "uvicorn>=0.37.0",
+]
