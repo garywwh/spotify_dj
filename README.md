@@ -33,12 +33,15 @@ Create a `.env` file in this project root:
 
 ```env
 OPENAI_API_KEY=your_openai_api_key
+SPOTIFY_DJ_MODEL=gpt-5-nano
 MCP_SERVER_URL=http://127.0.0.1:8080
 BRAVE_API_KEY=your_brave_api_key
 SPOTIFY_DJ_LOG_LEVEL=INFO
 ```
 
 `BRAVE_API_KEY` is optional. If it is missing, Spotify DJ still runs and skips web search.
+
+`SPOTIFY_DJ_MODEL` defaults to `gpt-5-nano`.
 
 `SPOTIFY_DJ_LOG_FORMAT` can be set to override the default log format.
 

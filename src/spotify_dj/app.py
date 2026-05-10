@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
-from .config import logger
+from .config import SPOTIFY_DJ_MODEL, logger
 from .models import PlaybackSelection, SearchSnippet, SelectionPlan
 from .services.mcp_client import (
     call_mcp_tool,
@@ -22,10 +22,19 @@ from .services.mcp_client import (
     extract_text_content,
     fetch_item_info,
 )
-from .services.planner import resolve_recommendation_plan, select_recommendation_plan
+from .services.planner import (
+    llm_text_response,
+    resolve_recommendation_plan,
+    select_recommendation_plan,
+)
 from .services.release_constraints import passes_release_constraints
 from .services.response_builder import compose_recommendation_message, derive_additional_info
-from .services.web_search import brave_web_search, needs_fresh_data
+from .services.web_search import (
+    brave_web_search,
+    expand_fresh_snippets,
+    fresh_search_queries,
+    needs_fresh_data,
+)
 
 
 class RecommendationRequest(BaseModel):
@@ -110,7 +119,7 @@ async def _generate_fun_fact_and_info(
         prompt += "Web snippets:\n" + snippet_text + "\n"
 
     try:
-        response = (await llm.apredict(prompt)).strip()
+        response = (await llm_text_response(llm, prompt)).strip()
         data = _extract_json_object(response)
     except Exception as exc:
         logger.warning("Fun fact generation failed: %s", exc)
@@ -156,7 +165,8 @@ async def lifespan(app: FastAPI):
 
         if os.getenv("OPENAI_API_KEY"):
             try:
-                app.state.llm = StopStrippingChatOpenAI(model="gpt-4.1-nano")
+                app.state.llm = StopStrippingChatOpenAI(model=SPOTIFY_DJ_MODEL)
+                logger.info("Initialized OpenAI chat model: %s", SPOTIFY_DJ_MODEL)
             except Exception as exc:
                 logger.exception("Failed to initialize OpenAI client: %s", exc)
         else:
@@ -194,7 +204,18 @@ async def recommend_music(payload: RecommendationRequest):
 
     snippets: list[SearchSnippet] = []
     if needs_fresh_data(topic):
-        snippets = await brave_web_search(topic, limit=5)
+        seen_urls: set[str] = set()
+        for query in fresh_search_queries(topic):
+            for snippet in await brave_web_search(query, limit=5):
+                if snippet.url in seen_urls:
+                    continue
+                seen_urls.add(snippet.url)
+                snippets.append(snippet)
+                if len(snippets) >= 8:
+                    break
+            if len(snippets) >= 8:
+                break
+        snippets.extend(await expand_fresh_snippets(snippets))
         logger.debug("Web snippets for topic '%s': %s", topic, snippets)
 
     recommendation_plan = await select_recommendation_plan(llm, topic, snippets=snippets)
