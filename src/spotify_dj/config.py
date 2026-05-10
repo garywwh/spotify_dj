@@ -16,6 +16,7 @@ _LOG_FORMAT = os.getenv(
     "SPOTIFY_DJ_LOG_FORMAT",
     "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
 )
+SPOTIFY_DJ_MODEL: Final[str] = os.getenv("SPOTIFY_DJ_MODEL", "gpt-5-nano")
 
 logger = logging.getLogger("spotify_dj")
 if not logger.handlers:
@@ -38,4 +39,4 @@ DJ_SYSTEM_MESSAGE: Final[str] = (
     "Always finish with a short recommendation plus any playback actions you took."
 )
 
-__all__ = ["logger", "DJ_SYSTEM_MESSAGE"]
+__all__ = ["logger", "DJ_SYSTEM_MESSAGE", "SPOTIFY_DJ_MODEL"]
