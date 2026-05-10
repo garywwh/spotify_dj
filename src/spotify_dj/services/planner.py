@@ -3,65 +3,147 @@
 from __future__ import annotations
 
 import json
-from typing import Any, List, Optional
+import re
+import unicodedata
+from typing import Any, Awaitable, Callable, List, Optional
 
 from langchain_openai import ChatOpenAI
 
 from ..config import logger
-from ..models import PlaybackSelection, SearchSnippet, SelectionPlan
+from ..models import PlaybackSelection, RecommendationPlan, SearchSnippet, SelectionPlan
 from .mcp_client import call_mcp_tool, parse_first_json_block
 
 
-def _select_album(data: dict[str, object]) -> Optional[PlaybackSelection]:
+_MEANINGFUL_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_QUOTED_TEXT_RE = re.compile(r"['\"“”‘’][^'\"“”‘’]+['\"“”‘’]")
+_SPECIFIC_REQUEST_RE = re.compile(
+    r"\b(play|listen to|spin|cue)\b.+\bby\b",
+    re.IGNORECASE,
+)
+_GENERIC_REQUEST_RE = re.compile(
+    r"\b("
+    r"recommend|recommendation|suggest|latest|newest|recent|"
+    r"new album|new release|new song|new single|new music|"
+    r"something|anything|album from|track from|released in|released on"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    normalized = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode()
+    return " ".join(_MEANINGFUL_TOKEN_RE.findall(normalized.lower()))
+
+
+def _title_matches(expected: str, actual: str) -> bool:
+    expected_normalized = _normalize_text(expected)
+    actual_normalized = _normalize_text(actual)
+    if not expected_normalized or not actual_normalized:
+        return False
+    if expected_normalized == actual_normalized:
+        return True
+
+    expected_tokens = set(expected_normalized.split())
+    actual_tokens = set(actual_normalized.split())
+    if len(expected_tokens) < 2:
+        return False
+    return expected_tokens.issubset(actual_tokens)
+
+
+def _artist_matches(expected_artists: list[str], actual_artists: list[str]) -> bool:
+    if not expected_artists:
+        return True
+
+    expected = [_normalize_text(artist) for artist in expected_artists]
+    actual = [_normalize_text(artist) for artist in actual_artists]
+    for expected_artist in expected:
+        if not expected_artist:
+            continue
+        for actual_artist in actual:
+            if expected_artist == actual_artist:
+                return True
+    return False
+
+
+def _matches_plan(selection: PlaybackSelection, plan: Optional[SelectionPlan]) -> bool:
+    if not plan:
+        return True
+    return _title_matches(plan.title, selection.name) and _artist_matches(plan.artists, selection.artists)
+
+
+def _infer_request_intent(topic: str, llm_intent: str) -> str:
+    """Keep generic recommendation prompts on the multi-candidate path."""
+    if _QUOTED_TEXT_RE.search(topic) or _SPECIFIC_REQUEST_RE.search(topic):
+        return "specific"
+    if _GENERIC_REQUEST_RE.search(topic):
+        return "generic"
+    return llm_intent
+
+
+def _select_album(
+    data: dict[str, object],
+    plan: Optional[SelectionPlan] = None,
+) -> Optional[PlaybackSelection]:
     results = data.get("results") or data
     albums = results.get("albums") if isinstance(results, dict) else None
     if not isinstance(albums, list) or not albums:
         return None
 
-    album = albums[0]
-    if not isinstance(album, dict):
-        return None
+    for album in albums:
+        if not isinstance(album, dict):
+            continue
 
-    album_id = album.get("id")
-    if not isinstance(album_id, str):
-        return None
+        album_id = album.get("id")
+        if not isinstance(album_id, str):
+            continue
 
-    artists_raw = album.get("artists") or ([album.get("artist")] if album.get("artist") else [])
-    artists = [artist for artist in artists_raw if isinstance(artist, str) and artist]
+        artists_raw = album.get("artists") or ([album.get("artist")] if album.get("artist") else [])
+        artists = [artist for artist in artists_raw if isinstance(artist, str) and artist]
 
-    return PlaybackSelection(
-        type="album",
-        name=str(album.get("name", "")),
-        artists=artists,
-        uri=f"spotify:album:{album_id}",
-        id=album_id,
-    )
+        selection = PlaybackSelection(
+            type="album",
+            name=str(album.get("name", "")),
+            artists=artists,
+            uri=f"spotify:album:{album_id}",
+            id=album_id,
+        )
+        if _matches_plan(selection, plan):
+            return selection
+    return None
 
 
-def _select_track(data: dict[str, object]) -> Optional[PlaybackSelection]:
+def _select_track(
+    data: dict[str, object],
+    plan: Optional[SelectionPlan] = None,
+) -> Optional[PlaybackSelection]:
     results = data.get("results") or data
     tracks = results.get("tracks") if isinstance(results, dict) else None
     if not isinstance(tracks, list) or not tracks:
         return None
 
-    track = tracks[0]
-    if not isinstance(track, dict):
-        return None
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
 
-    track_id = track.get("id")
-    if not isinstance(track_id, str):
-        return None
+        track_id = track.get("id")
+        if not isinstance(track_id, str):
+            continue
 
-    artists_raw = track.get("artists") or ([track.get("artist")] if track.get("artist") else [])
-    artists = [artist for artist in artists_raw if isinstance(artist, str) and artist]
+        artists_raw = track.get("artists") or ([track.get("artist")] if track.get("artist") else [])
+        artists = [artist for artist in artists_raw if isinstance(artist, str) and artist]
 
-    return PlaybackSelection(
-        type="track",
-        name=str(track.get("name", "")),
-        artists=artists,
-        uri=f"spotify:track:{track_id}",
-        id=track_id,
-    )
+        selection = PlaybackSelection(
+            type="track",
+            name=str(track.get("name", "")),
+            artists=artists,
+            uri=f"spotify:track:{track_id}",
+            id=track_id,
+        )
+        if _matches_plan(selection, plan):
+            return selection
+    return None
 
 
 async def select_music_plan(
@@ -69,13 +151,31 @@ async def select_music_plan(
     topic: str,
     snippets: Optional[List[SearchSnippet]] = None,
 ) -> Optional[SelectionPlan]:
+    recommendation_plan = await select_recommendation_plan(llm, topic, snippets=snippets)
+    if not recommendation_plan or not recommendation_plan.candidates:
+        return None
+    return recommendation_plan.candidates[0]
+
+
+async def select_recommendation_plan(
+    llm: ChatOpenAI,
+    topic: str,
+    snippets: Optional[List[SearchSnippet]] = None,
+) -> Optional[RecommendationPlan]:
     prompt = (
         "You are a knowledgeable DJ planning the next spin. "
         "Return ONLY a JSON object with the shape: \n"
         "{\n"
-        "  \"selection\": { \"title\": string, \"artists\": [strings], \"type\": 'album'|'track'|'playlist', \"notes\": string },\n"
-        "  \"announcement\": string (a short DJ-style intro announcing immediate playback)\n"
+        "  \"intent\": \"specific\" | \"generic\",\n"
+        "  \"candidates\": [\n"
+        "    { \"title\": string, \"artists\": [strings], \"type\": 'album'|'track', \"notes\": string, \"announcement\": string }\n"
+        "  ]\n"
         "}\n"
+        "Use intent=specific when the listener names a particular album, track, or artist/title target. "
+        "Use intent=generic when the listener asks for a recommendation matching constraints. "
+        "For generic requests, return exactly 5 distinct ranked candidates whenever possible; "
+        "do not stop after the first plausible answer. "
+        "For specific requests, return only the requested target. "
         "No text outside the JSON.\n"
         f"Listener request: {topic}\n"
     )
@@ -90,19 +190,77 @@ async def select_music_plan(
             prompt += "Recent web findings you can rely on:\n" + snippet_text + "\n"
 
     response = (await llm.apredict(prompt)).strip()
+    parsed = _parse_recommendation_response(topic, response)
+    if not parsed:
+        logger.warning("LLM plan missing usable candidates for topic '%s'", topic)
+        return None
+    intent, candidates = parsed
+
+    if intent == "generic" and len(candidates) < 2:
+        retry_prompt = (
+            prompt
+            + "\nYour previous response had too few candidates for a generic recommendation. "
+            + "Return ONLY JSON with intent=\"generic\" and exactly 5 distinct candidates. "
+            + "Do not repeat candidates that may be unavailable on Spotify.\n"
+        )
+        retry_response = (await llm.apredict(retry_prompt)).strip()
+        retry_parsed = _parse_recommendation_response(topic, retry_response)
+        if retry_parsed:
+            retry_intent, retry_candidates = retry_parsed
+            if retry_intent == "generic" and len(retry_candidates) >= 2:
+                response = retry_response
+                intent = retry_intent
+                candidates = retry_candidates
+
+    return RecommendationPlan(
+        intent=intent,
+        candidates=candidates,
+        raw_response=response,
+    )
+
+
+def _parse_recommendation_response(
+    topic: str,
+    response: str,
+) -> Optional[tuple[str, list[SelectionPlan]]]:
     data = _extract_json_object(response)
     if not data or not isinstance(data, dict):
         logger.warning("LLM plan did not return valid JSON for topic '%s'", topic)
         return None
 
-    selection = data.get("selection") if isinstance(data.get("selection"), dict) else None
-    if not selection:
-        logger.warning("LLM plan missing 'selection' field for topic '%s'", topic)
+    raw_candidates = data.get("candidates")
+    if not isinstance(raw_candidates, list):
+        selection = data.get("selection") if isinstance(data.get("selection"), dict) else None
+        raw_candidates = [selection] if selection else []
+
+    candidates: list[SelectionPlan] = []
+    for raw_candidate in raw_candidates[:5]:
+        if not isinstance(raw_candidate, dict):
+            continue
+
+        candidate = _parse_selection_plan(raw_candidate, response, data.get("announcement"))
+        if candidate:
+            candidates.append(candidate)
+
+    if not candidates:
         return None
 
+    intent = data.get("intent") or data.get("specificity") or "generic"
+    if not isinstance(intent, str):
+        intent = "generic"
+    intent = intent.lower()
+    if intent not in {"specific", "generic"}:
+        intent = "generic"
+    return _infer_request_intent(topic, intent), candidates
+
+
+def _parse_selection_plan(
+    selection: dict[str, Any],
+    raw_response: str,
+    fallback_announcement: object = None,
+) -> Optional[SelectionPlan]:
     title = selection.get("title") or selection.get("name")
     if not isinstance(title, str) or not title.strip():
-        logger.warning("LLM plan missing title for topic '%s'", topic)
         return None
 
     artists_field = selection.get("artists") or selection.get("artist")
@@ -117,16 +275,20 @@ async def select_music_plan(
     if not isinstance(item_type, str):
         item_type = "album"
     item_type = item_type.lower()
-    if item_type not in {"track", "album", "playlist"}:
+    if item_type not in {"track", "album"}:
         item_type = "album"
+
+    announcement = selection.get("announcement") or fallback_announcement
+    if not isinstance(announcement, str):
+        announcement = None
 
     return SelectionPlan(
         title=title.strip(),
         artists=artists,
         type=item_type,
         notes=selection.get("notes") or selection.get("reason"),
-        announcement=data.get("announcement"),
-        raw_response=response,
+        announcement=announcement,
+        raw_response=raw_response,
     )
 
 
@@ -157,18 +319,18 @@ async def resolve_playback_selection(
         artist_fragment = " ".join(artists) if artists else ""
         if title:
             query = f"{title} {artist_fragment}".strip()
-            preferred_qtype = item_type if item_type in {"album", "track", "playlist"} else "album"
+            preferred_qtype = item_type if item_type in {"album", "track"} else "album"
             search_variants.append({"query": query, "qtype": preferred_qtype, "limit": 5})
             if preferred_qtype != "track":
                 search_variants.append({"query": query, "qtype": "track", "limit": 5})
-
-    search_variants.extend(
-        [
-            {"query": topic, "qtype": "album", "limit": 5},
-            {"query": f"{topic} album", "qtype": "album", "limit": 5},
-            {"query": topic, "qtype": "track", "limit": 5},
-        ]
-    )
+    else:
+        search_variants.extend(
+            [
+                {"query": topic, "qtype": "album", "limit": 5},
+                {"query": f"{topic} album", "qtype": "album", "limit": 5},
+                {"query": topic, "qtype": "track", "limit": 5},
+            ]
+        )
 
     for params in search_variants:
         try:
@@ -178,13 +340,45 @@ async def resolve_playback_selection(
         data = parse_first_json_block(result)
         if not data:
             continue
-        album = _select_album(data)
+        album = _select_album(data, plan=plan)
         if album:
             return album
-        track = _select_track(data)
+        track = _select_track(data, plan=plan)
         if track:
             return track
     return None
 
 
-__all__ = ["select_music_plan", "resolve_playback_selection"]
+async def resolve_recommendation_plan(
+    topic: str,
+    mcp_url: str,
+    recommendation_plan: Optional[RecommendationPlan],
+    validator: Optional[Callable[[PlaybackSelection, SelectionPlan], Awaitable[bool]]] = None,
+) -> tuple[Optional[PlaybackSelection], Optional[SelectionPlan], list[SelectionPlan]]:
+    if not recommendation_plan:
+        selection = await resolve_playback_selection(topic, mcp_url, None)
+        return selection, None, []
+
+    attempted: list[SelectionPlan] = []
+    for candidate in recommendation_plan.candidates[:5]:
+        attempted.append(candidate)
+        selection = await resolve_playback_selection(topic, mcp_url, candidate)
+        if selection:
+            if validator and not await validator(selection, candidate):
+                if recommendation_plan.intent == "specific":
+                    break
+                continue
+            return selection, candidate, attempted
+
+        if recommendation_plan.intent == "specific":
+            break
+
+    return None, recommendation_plan.candidates[0] if recommendation_plan.candidates else None, attempted
+
+
+__all__ = [
+    "select_music_plan",
+    "select_recommendation_plan",
+    "resolve_playback_selection",
+    "resolve_recommendation_plan",
+]

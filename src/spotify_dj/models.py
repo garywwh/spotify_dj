@@ -24,6 +24,13 @@ class SelectionPlan:
 
 
 @dataclass
+class RecommendationPlan:
+    intent: str
+    candidates: List[SelectionPlan]
+    raw_response: Optional[str] = None
+
+
+@dataclass
 class PlaybackSelection:
     name: str
     uri: str
