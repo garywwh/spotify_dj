@@ -22,7 +22,9 @@ from .services.mcp_client import (
     extract_text_content,
     fetch_item_info,
 )
-from .services.planner import resolve_playback_selection, select_music_plan
+from .services.planner import resolve_recommendation_plan, select_recommendation_plan
+from .services.release_constraints import passes_release_constraints
+from .services.response_builder import compose_recommendation_message, derive_additional_info
 from .services.web_search import brave_web_search, needs_fresh_data
 
 
@@ -40,10 +42,6 @@ class StopStrippingChatOpenAI(ChatOpenAI):
     def _generate(self, messages, stop=None, **kwargs):  # type: ignore[override]
         kwargs.pop("stop", None)
         return super()._generate(messages, stop=None, **kwargs)
-
-
-def _format_artists(artists: list[str]) -> str:
-    return ", ".join(artists) if artists else "Unknown artist"
 
 
 def _extract_error_text(tool_result: Dict[str, Any]) -> Optional[str]:
@@ -66,83 +64,6 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _format_duration_ms(duration_ms: int) -> str:
-    minutes = duration_ms // 60000
-    seconds = (duration_ms % 60000) // 1000
-    return f"{minutes}:{seconds:02d}"
-
-
-def _coerce_artist_names(artists: Any) -> list[str]:
-    if isinstance(artists, dict):
-        name = artists.get("name")
-        return [name] if isinstance(name, str) and name else []
-    if isinstance(artists, list):
-        names: list[str] = []
-        for artist in artists:
-            if isinstance(artist, str) and artist:
-                names.append(artist)
-            elif isinstance(artist, dict):
-                name = artist.get("name")
-                if isinstance(name, str) and name:
-                    names.append(name)
-        return names
-    if isinstance(artists, str) and artists:
-        return [artists]
-    return []
-
-
-def _derive_additional_info(
-    selection: Optional[PlaybackSelection],
-    item_info: Optional[Dict[str, Any]],
-) -> Dict[str, str]:
-    if not selection or not item_info:
-        return {}
-
-    additional_info: Dict[str, str] = {}
-    item_type = selection.type
-
-    if item_type == "track":
-        song_bits: list[str] = []
-        duration_ms = item_info.get("duration_ms")
-        if isinstance(duration_ms, int) and duration_ms > 0:
-            song_bits.append(f"Duration {_format_duration_ms(duration_ms)}")
-        track_number = item_info.get("track_number")
-        if isinstance(track_number, int) and track_number > 0:
-            song_bits.append(f"Track {track_number}")
-        explicit = item_info.get("explicit")
-        if explicit is True:
-            song_bits.append("Explicit")
-        if song_bits:
-            additional_info["song"] = ", ".join(song_bits)
-
-        album_info = item_info.get("album")
-        if isinstance(album_info, dict):
-            album_name = album_info.get("name")
-            if isinstance(album_name, str) and album_name:
-                additional_info["album"] = f"From the album {album_name}."
-    elif item_type == "album":
-        album_bits: list[str] = []
-        release = item_info.get("release_date") or item_info.get("releaseDate")
-        if isinstance(release, str) and release:
-            album_bits.append(f"Released {release}")
-        total_tracks = item_info.get("total_tracks")
-        if isinstance(total_tracks, int) and total_tracks > 0:
-            album_bits.append(f"{total_tracks} tracks")
-        genres = item_info.get("genres")
-        if isinstance(genres, list):
-            genre_list = [genre for genre in genres if isinstance(genre, str) and genre]
-            if genre_list:
-                album_bits.append(f"Genres: {', '.join(genre_list)}")
-        if album_bits:
-            additional_info["album"] = ". ".join(album_bits) + "."
-
-    artists = _coerce_artist_names(item_info.get("artists") or item_info.get("artist"))
-    if artists:
-        additional_info["artist"] = f"Artists: {', '.join(artists)}."
-
-    return additional_info
-
-
 async def _generate_fun_fact_and_info(
     llm: ChatOpenAI,
     topic: str,
@@ -153,7 +74,7 @@ async def _generate_fun_fact_and_info(
     if not selection:
         return None, {}
 
-    fallback_info = _derive_additional_info(selection, item_info)
+    fallback_info = derive_additional_info(selection, item_info)
     fallback_fact = None
     if item_info:
         release = item_info.get("release_date") or item_info.get("releaseDate")
@@ -177,7 +98,8 @@ async def _generate_fun_fact_and_info(
     prompt = (
         "You are a music expert. Use only the provided data to write:\n"
         "- one fun fact (1 short sentence)\n"
-        "- additional info about the album, song, and artist (each 1 short sentence if possible)\n"
+        "- warm, specific additional info about the album, song, and artist (each 1 short sentence if possible)\n"
+        "Tone: easy, informed radio DJ on a weekend morning. Avoid hype, cliches, and unsupported claims.\n"
         "Return ONLY JSON with keys: fun_fact, album, song, artist.\n"
         "If you cannot support a field with the data, use an empty string.\n"
         f"Listener request: {topic}\n"
@@ -211,56 +133,6 @@ async def _generate_fun_fact_and_info(
         fun_fact = fallback_fact
 
     return fun_fact, additional_info
-
-
-def _compose_recommendation_message(
-    topic: str,
-    plan: Optional[SelectionPlan],
-    selection: Optional[PlaybackSelection],
-    item_info: Optional[Dict[str, Any]],
-    playback_status: str,
-    playback_error: Optional[str],
-    fun_fact: Optional[str],
-) -> str:
-    if not selection:
-        return (
-            "Couldn’t lock onto an exact match, so here’s a jazz staple you can’t miss: "
-            "Miles Davis – Kind of Blue. Modal magic, endlessly replayable. "
-            "Cue it up when you’re ready and let the cool tones flow."
-        )
-
-    artists = _format_artists(selection.artists)
-    title = selection.name or "Unknown selection"
-    lines: list[str] = []
-
-    if plan and plan.announcement:
-        lines.append(plan.announcement.strip())
-    else:
-        lines.append(f"Spinning {title} by {artists} — let's ride the groove.")
-
-    if plan and plan.notes:
-        lines.append(plan.notes.strip())
-
-    if item_info:
-        release = item_info.get("release_date") or item_info.get("releaseDate")
-        genres = item_info.get("genres")
-        if release:
-            lines.append(f"Released in {release}, it still sounds timeless.")
-        if isinstance(genres, list) and genres:
-            lines.append(f"Expect shades of {', '.join(genres)}.")
-
-    if playback_status == "started":
-        lines.append("Playback is live — enjoy the vibe!")
-    elif playback_status == "failed":
-        lines.append(f"Tried to start playback but hit a snag: {playback_error}.")
-    else:
-        lines.append("Couldn’t autoplay, but queue it up when you can.")
-
-    if fun_fact:
-        lines.append(f"Fun fact: {fun_fact}")
-
-    return " ".join(line for line in lines if line)
-
 
 # -- Application lifecycle ---------------------------------------------------
 
@@ -323,17 +195,47 @@ async def recommend_music(payload: RecommendationRequest):
     snippets: list[SearchSnippet] = []
     if needs_fresh_data(topic):
         snippets = await brave_web_search(topic, limit=5)
-        print(f"*** {snippets = }")
+        logger.debug("Web snippets for topic '%s': %s", topic, snippets)
 
-    plan = await select_music_plan(llm, topic, snippets=snippets)
-    print(f"*** {plan = }")
-    selection = await resolve_playback_selection(topic, mcp_url, plan)
-    if not selection:
-        selection = await resolve_playback_selection(topic, mcp_url, None)
-    print(f"*** {selection = }")
+    recommendation_plan = await select_recommendation_plan(llm, topic, snippets=snippets)
+    logger.debug("Recommendation plan for topic '%s': %s", topic, recommendation_plan)
+    item_info_cache: dict[str, Dict[str, Any]] = {}
 
-    item_info = await fetch_item_info(selection.uri, mcp_url) if selection else None
-    print(f"*** {item_info = }")
+    async def _validate_candidate(
+        candidate_selection: PlaybackSelection,
+        candidate_plan: SelectionPlan,
+    ) -> bool:
+        item_info = await fetch_item_info(candidate_selection.uri, mcp_url)
+        if item_info:
+            item_info_cache[candidate_selection.uri] = item_info
+        if passes_release_constraints(topic, item_info):
+            return True
+
+        release = item_info.get("release_date") or item_info.get("releaseDate") if item_info else None
+        logger.info(
+            "Skipping candidate that failed release constraints",
+            extra={
+                "topic": topic,
+                "candidate": candidate_plan.title,
+                "spotify_uri": candidate_selection.uri,
+                "release_date": release,
+            },
+        )
+        return False
+
+    selection, plan, attempted_plans = await resolve_recommendation_plan(
+        topic,
+        mcp_url,
+        recommendation_plan,
+        validator=_validate_candidate,
+    )
+    logger.debug("Matched plan for topic '%s': %s", topic, plan)
+    logger.debug("Playback selection for topic '%s': %s", topic, selection)
+
+    item_info = item_info_cache.get(selection.uri) if selection else None
+    if selection and not item_info:
+        item_info = await fetch_item_info(selection.uri, mcp_url)
+    logger.debug("Item info for topic '%s': %s", topic, item_info)
 
     fun_fact: Optional[str] = None
     additional_info: Dict[str, str] = {}
@@ -366,14 +268,17 @@ async def recommend_music(payload: RecommendationRequest):
             playback_status = "failed"
             playback_error = str(exc)
 
-    recommendation = _compose_recommendation_message(
+    recommendation = compose_recommendation_message(
         topic=topic,
+        recommendation_plan=recommendation_plan,
         plan=plan,
         selection=selection,
         item_info=item_info,
         playback_status=playback_status,
         playback_error=playback_error,
         fun_fact=fun_fact,
+        additional_info=additional_info,
+        attempted_plans=attempted_plans,
     )
 
     response: Dict[str, Any] = {
@@ -384,6 +289,10 @@ async def recommend_music(payload: RecommendationRequest):
 
     if plan:
         response["llm_plan"] = asdict(plan)
+    if recommendation_plan:
+        response["recommendation_plan"] = asdict(recommendation_plan)
+    if attempted_plans:
+        response["attempted_plans"] = [asdict(attempted_plan) for attempted_plan in attempted_plans]
     if snippets:
         response["web_search"] = [asdict(snippet) for snippet in snippets]
     if selection:

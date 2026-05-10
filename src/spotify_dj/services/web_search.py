@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import List
 
 import httpx
@@ -15,8 +16,8 @@ from ..models import SearchSnippet
 def needs_fresh_data(topic: str) -> bool:
     """Return True when the query likely requires up-to-date information."""
     lowered = topic.lower()
-    current_year = datetime.utcnow().year
-    year_cues = {str(current_year), str(current_year - 1)}
+    current_year = datetime.now(timezone.utc).year
+    mentioned_years = {int(year) for year in re.findall(r"\b((?:19|20)\d{2})\b", lowered)}
     freshness_cues = {
         "latest",
         "new release",
@@ -34,11 +35,9 @@ def needs_fresh_data(topic: str) -> bool:
         "this week",
         "this month",
         "this year",
-        "2023", 
-        "2024",
-        "2025"
     }
-    return any(cue in lowered for cue in freshness_cues | year_cues)
+    recent_years = {current_year, current_year - 1, current_year + 1}
+    return any(cue in lowered for cue in freshness_cues) or bool(mentioned_years & recent_years)
 
 
 async def brave_web_search(query: str, limit: int = 5) -> List[SearchSnippet]:
